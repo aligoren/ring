@@ -1,9 +1,19 @@
 use std::env;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 use std::thread::sleep;
-use rand::Rng;
 use std::io;
+use rand::Rng;
+use socket2::{Domain, Protocol, Socket, Type};
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+#[cfg(unix)]
+use libc::SOCK_RAW;
+
+#[cfg(windows)]
+const SOCK_RAW: i32 = 3;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -22,14 +32,18 @@ fn main() {
 
     println!("ringing {} with {} bytes of data:", target, packet_size);
 
-    match target.parse::<IpAddr>() {
-        Ok(ip) => {
-            run_ring(ip, count, packet_size, timeout, ttl, continuous);
-        }
-        Err(_) => {
-            println!("Invalid target address.");
-        }
-    }
+    let target_ip = match target.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => match resolve_target(target) {
+            Ok(ip) => ip,
+            Err(e) => {
+                println!("Invalid target address: {}", e);
+                return;
+            }
+        },
+    };
+
+    run_ring(target_ip, count, packet_size, timeout, ttl, continuous);
 }
 
 fn get_argument(args: &[String], option: &str, default: i32) -> i32 {
@@ -44,8 +58,10 @@ fn get_argument(args: &[String], option: &str, default: i32) -> i32 {
 }
 
 fn run_ring(target: IpAddr, mut count: i32, packet_size: usize, timeout: i32, ttl: i32, continuous: bool) {
-    let packet = create_icmp_packet(packet_size);
-    let socket_addr = match target {
+    let packet = create_icmp_packet(packet_size, target);
+    let socket = create_socket(target, ttl, timeout).expect("Failed to create socket");
+
+    let dest_addr = match target {
         IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), 0),
         IpAddr::V6(ip) => SocketAddr::new(IpAddr::V6(ip), 0),
     };
@@ -57,8 +73,7 @@ fn run_ring(target: IpAddr, mut count: i32, packet_size: usize, timeout: i32, tt
     let mut total_rtt = Duration::ZERO;
 
     while continuous || count > 0 {
-        let _start = Instant::now();
-        let result = send_and_receive_ring(&socket_addr, &packet, timeout);
+        let result = send_and_receive_ring(&socket, &packet, &dest_addr, timeout);
 
         if let Ok(rtt) = result {
             received += 1;
@@ -111,17 +126,59 @@ fn run_ring(target: IpAddr, mut count: i32, packet_size: usize, timeout: i32, tt
     }
 }
 
-fn create_icmp_packet(payload_size: usize) -> Vec<u8> {
+fn create_socket(target: IpAddr, ttl: i32, timeout: i32) -> io::Result<Socket> {
+    let domain = match target {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+
+    let protocol = match target {
+        IpAddr::V4(_) => Protocol::ICMPV4,
+        IpAddr::V6(_) => Protocol::ICMPV6,
+    };
+
+    let socket = Socket::new(domain, Type::from(SOCK_RAW), Some(protocol))?;
+
+    socket.set_read_timeout(Some(Duration::from_millis(timeout as u64)))?;
+    socket.set_write_timeout(Some(Duration::from_millis(timeout as u64)))?;
+
+    if let IpAddr::V6(_) = target {
+        socket.set_ttl(ttl as u32)?;
+    } else {
+        socket.set_multicast_ttl_v4(ttl as u32)?;
+    }
+
+    Ok(socket)
+}
+
+fn create_icmp_packet(payload_size: usize, target: IpAddr) -> Vec<u8> {
     let mut packet = vec![0u8; 8 + payload_size];
-    packet[0] = 8; // ICMP Type: Echo Request
-    packet[1] = 0; // Code: 0
+
+    match target {
+        IpAddr::V4(_) => {
+            packet[0] = 8; // ICMP Type: Echo Request (IPv4)
+            packet[1] = 0; // Code: 0
+        }
+        IpAddr::V6(_) => {
+            packet[0] = 128; // ICMPv6 Type: Echo Request
+            packet[1] = 0; // Code: 0
+        }
+    }
+
+    packet[2] = 0; // Checksum (initially 0, will be calculated)
+    packet[3] = 0;
+    packet[4] = 0; // Identifier
+    packet[5] = 1;
+    packet[6] = 0;
+    packet[7] = 1;
+
+    let mut rng = rand::thread_rng();
+    rng.fill(&mut packet[8..]);
 
     let checksum = compute_checksum(&packet);
     packet[2] = (checksum >> 8) as u8;
     packet[3] = (checksum & 0xFF) as u8;
 
-    let mut rng = rand::thread_rng();
-    rng.fill(&mut packet[8..]);
     packet
 }
 
@@ -145,10 +202,44 @@ fn compute_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn send_and_receive_ring(
-    _socket_addr: &SocketAddr,
-    _packet: &[u8],
-    _timeout: i32,
-) -> io::Result<Duration> {
-    Ok(Duration::from_millis(50))
+fn send_and_receive_ring(socket: &Socket, packet: &[u8], dest_addr: &SocketAddr, _timeout: i32) -> io::Result<Duration> {
+    let start = Instant::now();
+    let sockaddr = socket2::SockAddr::from(*dest_addr);
+    socket.send_to(packet, &sockaddr)?;
+
+    let mut buffer = [std::mem::MaybeUninit::<u8>::uninit(); 1024];
+    let read_size = socket.recv(&mut buffer)?;
+
+    let _received_data = unsafe {
+        std::slice::from_raw_parts(buffer.as_ptr() as *const u8, read_size)
+    };
+
+    Ok(start.elapsed())
+}
+
+
+fn resolve_target(target: &str) -> Result<IpAddr, String> {
+    match (target, 0).to_socket_addrs() {
+        Ok(iter) => {
+            let mut ipv4_addr = None;
+            let mut ipv6_addr = None;
+
+            for addr in iter {
+                match addr.ip() {
+                    IpAddr::V4(ipv4) => ipv4_addr = Some(IpAddr::V4(ipv4)),
+                    IpAddr::V6(ipv6) => ipv6_addr = Some(IpAddr::V6(ipv6)),
+                }
+            }
+
+            if let Some(ipv4) = ipv4_addr {
+                return Ok(ipv4);
+            }
+            if let Some(ipv6) = ipv6_addr {
+                return Ok(ipv6);
+            }
+
+            Err("No valid IP address found.".to_string())
+        }
+        Err(e) => Err(format!("Failed to resolve domain: {}", e)),
+    }
 }

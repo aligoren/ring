@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 rand = "0.8.5"
+socket2 = "0.5.8"
+libc = "0.2.169"
