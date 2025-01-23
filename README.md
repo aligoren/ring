@@ -67,9 +67,13 @@ For production builds:
 We plan to introduce the following features:
 
 📡 Parallel pinging of multiple hosts
+
 📜 JSON output support for automation
+
 📈 Graphical statistics
+
 🖥️ Web-based interface for real-time monitoring
+
 Contributions are welcome! If you would like to contribute, feel free to open issues or submit pull requests.
 
 ## 📄 License
